@@ -1,16 +1,16 @@
 <?php
 
+use App\Http\Controllers\BoardController;
+use App\Http\Controllers\CardController;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
-use App\Http\Controllers\CardController;
-use App\Http\Controllers\BoardController;
 use Spatie\Health\Http\Controllers\HealthCheckJsonResultsController;
 
 // Rota de Liveness (Livre e rápida)
 Route::get('/health/live', function () {
     return response()->json([
         'status' => 'alive',
-        'timestamp' => now()->toIso8601String()
+        'timestamp' => now()->toIso8601String(),
     ], 200);
 });
 
@@ -22,14 +22,12 @@ Route::middleware(['auth.jwt'])->group(function () {
     Route::get('/user-check', function (Request $request) {
         return response()->json([
             'message' => 'Token JWT válido!',
-            'user' => $request->attributes->get('user')
+            'user' => $request->attributes->get('user'),
         ]);
     });
 
-    Route::apiResource('boards', BoardController::class);
-    Route::apiResource('cards', CardController::class);
+    // Kanban READ-ONLY (CQRS): mutações ocorrem no Booking Service via RabbitMQ
+    Route::apiResource('boards', BoardController::class)->only(['index', 'show']);
+    Route::apiResource('cards', CardController::class)->only(['index', 'show']);
 
 });
-
-
-

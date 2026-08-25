@@ -36,11 +36,11 @@ Este repositório contém o **Serviço Kanban**, um microsserviço construído c
 
 Sua responsabilidade dentro do ecossistema é:
 
-- Gerenciar o ciclo de vida completo de **Quadros (Boards)** e **Cartões (Cards)** do Kanban via API REST.
-- Atuar como **consumidor (Consumer)** de eventos publicados pelo Serviço de Reuniões (Node.js) via **RabbitMQ**, transformando automaticamente novas reuniões agendadas em cartões no Kanban.
-- Publicar eventos na fila `cards_queue` do RabbitMQ ao criar ou mover cartões, notificando outros serviços do ecossistema.
-- Manter uma **Read Model** da tabela `reunioes_read` sincronizada com os eventos consumidos, seguindo o princípio **CQRS** para consultas otimizadas.
-- Expor endpoints de **health check** e métricas **Prometheus** para monitoramento e orquestração pelos serviços de infraestrutura.
+- Expor o **Read Model do Kanban** via API REST **somente leitura** (`GET` de Boards e Cards).
+- Atuar como **consumidor** dos eventos publicados pelo Booking Service (Node.js) via **RabbitMQ**.
+- Projetar reuniões da fila `reuniao_criada` em `reunioes_read` e em cards do quadro `Reuniões`.
+- Projetar mutações de Kanban da fila `kanban_events` na tabela `cards` (`source_id` = ID do Write Model).
+- Expor endpoints de **health check** e métricas **Prometheus**.
 
 ---
 
@@ -55,9 +55,9 @@ O ecossistema é composto por três serviços que se comunicam de forma assíncr
 │  ┌──────────────┐   REST/JWT   ┌────────────────────────────┐   │
 │  │              │ ──────────▶  │  Serviço de Reuniões       │   │
 │  │   Frontend   │              │  (Node.js + PostgreSQL)    │   │
-│  │   (Flutter)  │   REST       │                            │   │
-│  │              │ ──────────▶  │  Publica evento:           │   │
-│  └──────────────┘              │  "reuniao_criada"          │   │
+│  │   (Flutter)  │   GET only   │                            │   │
+│  │              │ ──────────▶  │  Publica: reuniao_criada   │   │
+│  └──────────────┘              │  Publica: kanban_events    │   │
 │                                └───────────┬────────────────┘   │
 │                                            │ Publica evento      │
 │                                            ▼                    │
@@ -71,8 +71,9 @@ O ecossistema é composto por três serviços que se comunicam de forma assíncr
 │  │   Frontend   │ ──────────▶  │  Serviço Kanban (este)     │   │
 │  │   (Flutter)  │              │  (Laravel 12 + MySQL 8.0)  │   │
 │  └──────────────┘              │                            │   │
-│                                │  ▪ Consumer de eventos     │   │
-│                                │  ▪ Producer para cards_q.  │   │
+│                                │  ▪ Consumer READ-ONLY      │   │
+│                                │  ▪ Filas: reuniao_criada,  │   │
+│                                │    kanban_events           │   │
 │                                │  ▪ Read Model (CQRS)       │   │
 │                                │  ▪ Cache com Redis 7       │   │
 │                                └────────────────────────────┘   │
@@ -81,14 +82,15 @@ O ecossistema é composto por três serviços que se comunicam de forma assíncr
 
 ### Fluxo de Comunicação
 
-**1. Frontend → Serviço Kanban (REST/JWT)**
-O aplicativo Flutter realiza chamadas REST diretamente para este serviço, utilizando **JWT** para autenticação. O token é emitido por outro serviço do ecossistema e validado aqui pelo middleware `JwtMiddleware` com a biblioteca `firebase/php-jwt`.
+**1. Frontend → Serviço Kanban (REST/JWT, somente GET)**
+O Flutter consulta este serviço (`GET /api/boards`, `GET /api/cards`). Mutações **não** são aceitas aqui: `POST`/`PUT`/`DELETE` de boards e cards foram removidos. O JWT continua sendo validado pelo `JwtMiddleware`.
 
-**2. Serviço de Reuniões → RabbitMQ → Serviço Kanban (Event-Driven)**
-Quando uma reunião é criada no serviço Node.js, ele publica um evento no RabbitMQ. O worker do Laravel (`php artisan queue:work`) consome esse evento e o Job `ProcessarEventoReuniao` grava as informações na tabela de leitura `reunioes_read` (Read Model CQRS), com idempotência garantida por checagem de UUID.
+**2. Booking Service → RabbitMQ → Serviço Kanban (Event-Driven)**
+- Fila `reuniao_criada`: comando `php artisan rabbitmq:consume-reuniao-criada` grava em `reunioes_read` e cria um card (idempotência pelo `id` da reunião).
+- Fila `kanban_events`: comando `php artisan rabbitmq:consume-kanban-events` aplica `CardCriadoEvent`, `CardAtualizadoEvent`, `CardMovidoEvent` e `CardDeletadoEvent` na tabela `cards` (idempotência pelo `source_id`).
 
-**3. Serviço Kanban → RabbitMQ (Producer)**
-O `CardService` age como **produtor**: ao criar ou mover um cartão, publica um evento na fila `cards_queue`, permitindo que outros serviços reajam a essas mudanças de estado.
+**3. Kanban READ-ONLY (sem producer de cards)**
+O `CardService` não publica mais em `cards_queue`. A escrita do Kanban vive no Node.js; o Laravel apenas projeta o estado.
 
 **4. Rastreabilidade Distribuída**
 O middleware `CorrelationIdMiddleware` propaga o cabeçalho `X-Correlation-ID` entre requisições, garantindo rastreabilidade de ponta a ponta no log centralizado do ecossistema.
@@ -128,10 +130,13 @@ O `CircuitBreakerService` (implementado com a biblioteca **Ganesha** + Redis) pr
 MicroSaas_To_do/
 └── php-service/                        # Raiz da aplicação Laravel
     ├── app/
+    │   ├── Console/Commands/
+    │   │   ├── ConsumeReuniaoCriada.php     # Consumer da fila reuniao_criada
+    │   │   └── ConsumeKanbanEvents.php      # Consumer da fila kanban_events
     │   ├── Http/
     │   │   ├── Controllers/
-    │   │   │   ├── BoardController.php      # CRUD de Quadros (Boards)
-    │   │   │   └── CardController.php       # CRUD de Cartões (Cards)
+    │   │   │   ├── BoardController.php      # Leitura de Quadros (index/show)
+    │   │   │   └── CardController.php       # Leitura de Cartões (index/show)
     │   │   └── Middleware/
     │   │       ├── JwtMiddleware.php         # Validação de tokens JWT externos
     │   │       └── CorrelationIdMiddleware.php # Rastreabilidade distribuída
@@ -152,18 +157,19 @@ MicroSaas_To_do/
     │   │       ├── EloquentBoardRepository.php
     │   │       └── EloquentCardRepository.php
     │   └── Service/
-    │       ├── CardService.php              # Lógica de negócio + publicação no RabbitMQ
+    │       ├── CardService.php              # Consultas do Kanban (sem publish)
     │       ├── CircuitBreakerService.php    # Circuit Breaker (Ganesha + Redis)
-    │       └── RabbitMQService.php          # Abstração de publicação de mensagens AMQP
+    │       └── RabbitMQService.php          # Abstração AMQP (publicação legado/resiliência)
     ├── database/
     │   └── migrations/
     │       ├── ..._create_users_table.php
     │       ├── ..._create_boards_table.php
     │       ├── ..._create_cards_table.php
-    │       ├── ..._create_jobs_table.php           # Tabela de filas (driver database)
+    │       ├── ..._add_kanban_fields_to_cards_table.php  # column_id, priority, assignee, tags, source_id
+    │       ├── ..._create_jobs_table.php
     │       ├── ..._create_cache_table.php
     │       ├── ..._create_personal_access_tokens_table.php
-    │       └── ..._create_reunioes_read_tables.php  # Read Model CQRS
+    │       └── ..._create_reunioes_read_tables.php
     ├── routes/
     │   ├── api.php                          # Todas as rotas REST da API
     │   └── web.php                          # Rota de smoke test
@@ -195,6 +201,11 @@ MicroSaas_To_do/
 | `title` | VARCHAR | Título do cartão |
 | `description` | TEXT (nullable) | Descrição detalhada |
 | `position` | INTEGER | Posição de ordenação dentro do quadro |
+| `column_id` | VARCHAR | Coluna do Kanban (`backlog`, `todo`, etc.) |
+| `priority` | INTEGER | Prioridade projetada do Write Model |
+| `assignee` | VARCHAR (nullable) | Responsável |
+| `tags` | JSON (nullable) | Tags do card |
+| `source_id` | VARCHAR (unique, nullable) | ID do card no Booking Service (idempotência) |
 | `created_at` | TIMESTAMP | Data de criação |
 | `updated_at` | TIMESTAMP | Data da última atualização |
 
@@ -208,13 +219,13 @@ MicroSaas_To_do/
 | `created_at` | TIMESTAMP | Data de criação |
 | `updated_at` | TIMESTAMP | Data da última atualização |
 
-> **Nota de idempotência:** O Job `ProcessarEventoReuniao` verifica se o UUID já existe em `reunioes_read` antes de inserir, garantindo que mensagens entregues mais de uma vez pelo RabbitMQ não causem duplicidade.
+> **Nota de idempotência:** o consumidor `rabbitmq:consume-reuniao-criada` ignora reuniões cujo `id` já existe em `reunioes_read`. O consumidor `rabbitmq:consume-kanban-events` identifica cards pelo `source_id`.
 
 ---
 
 ## 6. Endpoints da API REST
 
-A aplicação roda na porta `8081` (via Docker). Todas as rotas de negócio exigem o cabeçalho `Authorization: Bearer <JWT_TOKEN>`.
+A stack unificada (`booking-service/docker-compose.yml`) expõe este serviço na porta **8000**. O `docker-compose.yaml` isolado deste repositório usa a porta **8081**. Todas as rotas de negócio exigem `Authorization: Bearer <JWT_TOKEN>`.
 
 ### Health & Observabilidade *(públicas)*
 
@@ -229,20 +240,18 @@ A aplicação roda na porta `8081` (via Docker). Todas as rotas de negócio exig
 | Método | Rota | Descrição |
 |---|---|---|
 | `GET` | `/api/boards` | Lista todos os quadros *(com cache Redis de 5 min)* |
-| `POST` | `/api/boards` | Cria um novo quadro |
 | `GET` | `/api/boards/{id}` | Exibe um quadro específico *(com cache Redis de 5 min)* |
-| `PUT` | `/api/boards/{id}` | Atualiza um quadro *(invalida cache)* |
-| `DELETE` | `/api/boards/{id}` | Remove um quadro *(invalida cache)* |
+
+> Mutações de boards (`POST`/`PUT`/`DELETE`) **não são expostas**. O Kanban neste serviço é READ-ONLY.
 
 ### Cards *(requer JWT)*
 
 | Método | Rota | Descrição |
 |---|---|---|
 | `GET` | `/api/cards` | Lista todos os cartões |
-| `POST` | `/api/cards` | Cria um novo cartão *(publica evento em `cards_queue`)* |
 | `GET` | `/api/cards/{id}` | Exibe um cartão específico |
-| `PUT` | `/api/cards/{id}` | Atualiza um cartão |
-| `DELETE` | `/api/cards/{id}` | Remove um cartão |
+
+> Mutações de cards (`POST`/`PUT`/`DELETE`) **não são expostas**. Criação, atualização, movimentação e exclusão ocorrem no Booking Service e chegam via `kanban_events`.
 
 ### Verificação de Token
 
@@ -266,7 +275,7 @@ A tabela `reunioes_read` é uma projeção de leitura (Read Model) alimentada pe
 A publicação no RabbitMQ é protegida pelo `CircuitBreakerService`, configurado com estratégia de taxa de falhas: o circuito abre se ≥ 50% das requisições falharem em uma janela de 30 segundos (com mínimo de 5 requisições). O estado do circuito é armazenado no Redis. Quando aberto, o serviço retorna um fallback imediatamente em vez de acumular timeouts.
 
 ### Cache com Redis
-Leituras de `boards` (listagem e item) são cacheadas no Redis por 5 minutos. As operações de escrita (update/delete) invalidam as chaves correspondentes imediatamente (`Cache::forget`). O `InvalidateBoardCache` listener também realiza essa invalidação ao consumir eventos externos.
+Leituras de `boards` (listagem e item) são cacheadas no Redis por 5 minutos. Os consumers invalidam `boards:all` após projetar eventos.
 
 ### Rastreabilidade com Correlation ID
 O `CorrelationIdMiddleware` lê ou gera um UUID em `X-Correlation-ID` em cada requisição, injeta-o no contexto de log global do Laravel (`Log::shareContext`) e o repassa no cabeçalho da resposta. Isso permite correlacionar logs entre todos os microsserviços do ecossistema em uma ferramenta de log centralizada.
@@ -397,15 +406,14 @@ docker exec -it micro-app chmod -R 777 storage bootstrap/cache
 docker exec -it micro-app php artisan l5-swagger:generate
 ```
 
-### Passo 10 — Inicie o worker de filas (Consumer RabbitMQ)
+### Passo 10 — Inicie os consumers RabbitMQ
 
-Em um terminal separado, mantenha o worker rodando para consumir os eventos do RabbitMQ:
+Na stack unificada os workers sobem automaticamente. Em execução isolada:
 
 ```bash
-docker exec -it micro-app php artisan queue:work --tries=3 --timeout=60
+docker exec -it micro-app php artisan rabbitmq:consume-reuniao-criada
+docker exec -it micro-app php artisan rabbitmq:consume-kanban-events
 ```
-
-Para produção, utilize um gerenciador de processos como **Supervisor** para manter o worker sempre ativo.
 
 ---
 
@@ -415,9 +423,10 @@ Após todos os passos, os seguintes endereços devem estar acessíveis:
 
 | Serviço | URL | Credenciais |
 |---|---|---|
-| **API Kanban** | `http://localhost:8081` | — |
-| **Swagger UI** | `http://localhost:8081/api/documentation` | — |
-| **Health Check** | `http://localhost:8081/api/health/ready` | — |
+| **API Kanban (stack unificada)** | `http://localhost:8000` | — |
+| **API Kanban (compose isolado)** | `http://localhost:8081` | — |
+| **Swagger UI (unificada)** | `http://localhost:8000/api/documentation` | — |
+| **Health Check** | `http://localhost:8000/api/health/ready` | — |
 | **RabbitMQ Management** | `http://localhost:15672` | `guest` / `guest` |
 
 ---
