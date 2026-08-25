@@ -12,6 +12,7 @@
         "laravel/framework": "^12.0",
         "laravel/sanctum": "^4.0",
         "laravel/tinker": "^2.10.1",
+        "php-amqplib/php-amqplib": "^3.7",
         "spatie/laravel-health": "*",
         "spatie/laravel-prometheus": "*",
         "vladimir-yuldashev/laravel-queue-rabbitmq": "^14.5"
